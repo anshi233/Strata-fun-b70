@@ -50,6 +50,37 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
 void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
                            int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream);
 
+/// Host-side launch facts for the opt-in width-bounded entry.
+/// These are counts of CTA grid slots, not device counters.
+struct QsaWidthLaunchInfo {
+    bool bounded = false;
+    int64_t n_chunks_cap = 0;
+    int64_t n_chunks_launch = 0;
+    int64_t n_chunks_active = 0;
+};
+
+/// True when this build/device would take the pre-sm_75 attention kernel.
+/// Host-only; used by startup validation and the prefill preflight so the
+/// integrated option never enables an unsupported pre75 contract.
+bool qsa_decode_attn_pre75_active();
+
+/// Opt-in width-bounded variant.  `max_width` must be the maximum valid step
+/// width over this batch, already validated on the host from the real
+/// [n_q][kStepCount] step records (1 <= max_width <= cap).  The scratch stride
+/// and every partial slot keep the cap-based ceil(cap/64) chunk layout; only
+/// grid.x and the merge traversal are bounded by ceil(max_width/64).
+///
+/// The startup decision (`--qsa-width-bound 1`, or legacy
+/// STRATA_QSA_WIDTH_BOUND=1) is required.  Unsupported formats/RS/LANECELL/
+/// pre75, a malformed hint, or a launch-geometry failure print an explicit
+/// host error and return false WITHOUT launching anything; there is no
+/// fallback to the old path.  The old qsa_decode_attn_batch remains the
+/// separate default entry.
+bool qsa_decode_attn_batch_max_width(const float* q, const QsaAttnPools& pools, const int32_t* ids,
+                                     const int32_t* steps, int64_t cap, const QsaShapes& s, float* scratch,
+                                     float* attn, int64_t n_q, int64_t max_width, void* stream,
+                                     QsaWidthLaunchInfo* info = nullptr);
+
 /// Up to this many queries of different slots in one qsa_decode_attn_slots call.
 constexpr int kQsaAttnMaxSlots = 8;
 

@@ -32,6 +32,7 @@
 #include "strata/core/native_head.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
+#include "strata/kernels/qsa_width_policy.hpp"
 #include "strata/kernels/qsa_prompt_attn.hpp"
 #include "strata/kernels/qsa_select.hpp"
 #include "strata/prefill/gemm.hpp"
@@ -106,6 +107,18 @@ namespace strata::prefill {
 namespace {
 
 using Clock = std::chrono::steady_clock;
+
+// Host control: the option is resolved once at engine startup; this host read
+// never touches getenv in the batch loop.
+inline bool qsa_width_bound_on() { return strata::kernels::qsa_width_bound_enabled(); }
+inline int qsa_width_rs_env() {
+    static const int rs = [] { const char* v = std::getenv("STRATA_ATTN_RS"); return v ? std::atoi(v) : 2; }();
+    return rs;
+}
+inline bool qsa_width_lane_cell_env() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_ATTN_LANECELL"); return v && v[0] == '1'; }();
+    return on;
+}
 
 // 0.1.48, A750 deadlock: SYCL has no cudaHostRegister, so the expert arena is ordinary pageable memory even where the engine
 // calls it "pinned" (pinned.dp.cpp registers nothing).  A DMA straight from it, `copy->memcpy(stage, arena_ptr, 2.3 MB)`, makes the
@@ -731,6 +744,12 @@ struct Prefill::Impl {
     int64_t sel_batch = 256, max_blocks = 0;
     float* attn_scratch = nullptr;
     int64_t attn_batch = 32, cap = 0;
+    // Request aggregate: host counts of batches that entered the width-bounded
+    // entry and of cap-grid vs bounded-grid CTA slots.  Reset by
+    // Prefill::run for each request; these are not device counters.
+    int64_t qsa_wb_batches = 0;
+    int64_t qsa_wb_cap_ctas = 0;
+    int64_t qsa_wb_bounded_ctas = 0;
     // MoE
     float *logits = nullptr, *w = nullptr, *GU = nullptr, *Dm = nullptr, *sgate = nullptr, *sup = nullptr,
           *shared = nullptr, *sg = nullptr;
@@ -2636,6 +2655,41 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
         lap("PLE rows");
         // ---- the QSA step records of every position in the chunk
         for (int64_t t = 0; t < T; ++t) strata::kernels::qsa_step_fill(m.steps_host.data() + t * strata::kernels::kStepCount, p0 + t, s);
+        // Validate the real interleaved records once for this chunk (offset +
+        // kStepCount stride from qsa.hpp), before any batch is
+        // launched.  An enabled malformed contract is a host error, not a
+        // fallback.  The validated widths are non-decreasing, so each batch's
+        // maximum is its last row's width (O(1), no per-batch rescan).
+        if (qsa_width_bound_on()) {
+            int64_t width_max = 0;
+            if (!strata::kernels::qsa_width_steps_ok(m.steps_host.data(), T, m.cap, s, p0, &width_max)) {
+                std::fprintf(stderr,
+                             "qsa width-bound: malformed step records at p0=%lld T=%lld cap=%lld\n",
+                             (long long) p0, (long long) T, (long long) m.cap);
+                err = "qsa width-bound: malformed step records";
+                return false;
+            }
+            if (width_max <= 0) {
+                std::fprintf(stderr, "qsa width-bound: empty width sequence at p0=%lld\n", (long long) p0);
+                err = "qsa width-bound: empty width sequence";
+                return false;
+            }
+            // Host shape/format preflight, once for this chunk and before any
+            // QSA batch launch.  The API repeats it defensively and fails hard;
+            // there is no cap-grid fallback when the flag is enabled.
+            const core::QsaState& st0 = ss.qsa_states[ss.qsa_primary()];
+            const int qsa_kv_mode = st0.kv_hybrid ? 3 : (st0.kv_q4 ? 2 : (st0.kv_int8 ? 1 : 0));
+            if (!strata::kernels::qsa_width_supported(
+                    qsa_kv_mode, qsa_width_rs_env(), qsa_width_lane_cell_env(),
+                    strata::kernels::qsa_decode_attn_pre75_active())) {
+                std::fprintf(stderr,
+                             "qsa width-bound: unsupported host contract kv_mode=%d rs=%d lane_cell=%d pre75=%d\n",
+                             qsa_kv_mode, qsa_width_rs_env(), (int) qsa_width_lane_cell_env(),
+                             (int) strata::kernels::qsa_decode_attn_pre75_active());
+                err = "qsa width-bound: unsupported host contract";
+                return false;
+            }
+        }
         /*
         DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy API.
         While the origin API might be synchronous, it depends on the type of
@@ -3432,9 +3486,33 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                                                                             m.attn, T, m.cs))
                         for (int64_t t0 = 0; t0 < T; t0 += m.attn_batch) {
                             const int64_t nb = std::min(m.attn_batch, T - t0);
-                            strata::kernels::qsa_decode_attn_batch(m.q + t0 * ZV, pools, m.sel_ids + t0 * m.cap,
-                                                                   m.steps_dev + t0 * strata::kernels::kStepCount, m.cap,
-                                                                   s, m.attn_scratch, m.attn + t0 * ZV, nb, m.cs);
+                            if (qsa_width_bound_on()) {
+                                // The whole chunk was validated once above, so
+                                // this batch's max is its last row's width.
+                                const int64_t width_max = strata::kernels::qsa_width_batch_max(
+                                    m.steps_host.data(), t0, nb);
+                                strata::kernels::QsaWidthLaunchInfo wi;
+                                if (!strata::kernels::qsa_decode_attn_batch_max_width(
+                                        m.q + t0 * ZV, pools, m.sel_ids + t0 * m.cap,
+                                        m.steps_dev + t0 * strata::kernels::kStepCount,
+                                        m.cap, s, m.attn_scratch, m.attn + t0 * ZV, nb, width_max, m.cs, &wi) ||
+                                    !wi.bounded || wi.n_chunks_cap <= 0 || wi.n_chunks_launch <= 0 ||
+                                    wi.n_chunks_launch > wi.n_chunks_cap) {
+                                    std::fprintf(stderr,
+                                                 "qsa width-bound: batch launch rejected t0=%lld nb=%lld width=%lld\n",
+                                                 (long long) t0, (long long) nb, (long long) width_max);
+                                    err = "qsa width-bound: batch launch rejected";
+                                    return false;
+                                }
+                                m.qsa_wb_batches += 1;
+                                m.qsa_wb_cap_ctas += wi.n_chunks_cap * s.n_head_kv * nb;
+                                m.qsa_wb_bounded_ctas += wi.n_chunks_launch * s.n_head_kv * nb;
+                            } else {
+                                strata::kernels::qsa_decode_attn_batch(
+                                    m.q + t0 * ZV, pools, m.sel_ids + t0 * m.cap,
+                                    m.steps_dev + t0 * strata::kernels::kStepCount, m.cap,
+                                    s, m.attn_scratch, m.attn + t0 * ZV, nb, m.cs);
+                            }
                         }
                     if (st.kv_rot || st.kv_hybrid) strata::kernels::fwht256_inplace_cuda(m.attn, T * 24, m.cs);
                     pt.mark(kPfQsa, cs);
@@ -5038,10 +5116,36 @@ bool Prefill::drain_pipeline(std::string& err) {
 }
 
 bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err) {
+    // One request aggregate, reset for every request and reported after the
+    // prompt path.  These are host counts of CTA grid
+    // slots, not device counters; no device readback or wait is added.
+    if (qsa_width_bound_on()) {
+        for (Prefill* p = this; p != nullptr; p = p->next_) {
+            if (p->impl_) {
+                p->impl_->qsa_wb_batches = 0;
+                p->impl_->qsa_wb_cap_ctas = 0;
+                p->impl_->qsa_wb_bounded_ctas = 0;
+            }
+        }
+    }
     const bool body_ok = run_impl(tokens, n, pos0, err);
 
     std::string drain_err;
     const bool drain_ok = drain_pipeline(drain_err);
+
+    if (qsa_width_bound_on()) {
+        int64_t batches = 0, cap_ctas = 0, bounded_ctas = 0;
+        for (Prefill* p = this; p != nullptr; p = p->next_) {
+            if (p->impl_) {
+                batches += p->impl_->qsa_wb_batches;
+                cap_ctas += p->impl_->qsa_wb_cap_ctas;
+                bounded_ctas += p->impl_->qsa_wb_bounded_ctas;
+            }
+        }
+        std::fprintf(stderr,
+                     "strata: qsa_width_bound host_counts=1 bounded_batches=%lld cap_grid_ctas=%lld bounded_grid_ctas=%lld\n",
+                     (long long) batches, (long long) cap_ctas, (long long) bounded_ctas);
+    }
 
     if (!body_ok) return false;
     if (!drain_ok) {

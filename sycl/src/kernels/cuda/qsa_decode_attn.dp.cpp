@@ -5,6 +5,7 @@
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
+#include "strata/kernels/qsa_width_policy.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/kv_q4.hpp"
 
@@ -588,7 +589,9 @@ __dpct_inline__ void attn_merge_kernel(const float *__restrict__ part_acc,
                                        const float *__restrict__ part_m,
                                        const float *__restrict__ part_l,
                                        int n_chunks, float *__restrict__ attn,
-                                       long long scratch_stride = 0) {
+                                       long long scratch_stride = 0,
+                                       int n_chunks_active = -1,
+                                       const int32_t *__restrict__ steps = nullptr) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     part_acc += (size_t)item_ct1.get_group(1) * (size_t)scratch_stride;
     part_m += (size_t)item_ct1.get_group(1) * (size_t)scratch_stride;
@@ -598,12 +601,22 @@ __dpct_inline__ void attn_merge_kernel(const float *__restrict__ part_acc,
     const int h = item_ct1.get_group(2); // global query head
     const int kvh = h / G, hl = h % G;
     const int d = item_ct1.get_local_id(2);
+    // n_chunks is the cap-based slot/stride layout.  The default -1 keeps the
+    // unchanged callers on the full traversal.  The width-bounded entry passes
+    // the validated batch launch bound and, for the per-query bound, the real step
+    // records: n_act = ceil(width/64), exactly like CUDA attn_merge_v2_kernel.
+    if (n_chunks_active < 0) n_chunks_active = n_chunks;
+    if (steps != nullptr) {
+        const int width = steps[(size_t) item_ct1.get_group(1) * kStepCount + kStepWidth];
+        const int qact = width > 0 ? (width + CHUNK - 1) / CHUNK : 0;
+        n_chunks_active = sycl::min(n_chunks_active, sycl::min(qact, n_chunks));
+    }
     float M = -FLT_MAX;
 #pragma unroll
-    for (int c = 0; c < n_chunks; ++c)
+    for (int c = 0; c < n_chunks_active; ++c)
         M = sycl::fmax(M, part_m[(kvh * n_chunks + c) * G + hl]);
     float L = 0.0f, acc = 0.0f;
-    for (int c = 0; c < n_chunks; ++c) {
+    for (int c = 0; c < n_chunks_active; ++c) {
         const int slot = kvh * n_chunks + c;
         const float m = part_m[slot * G + hl];
         if (m == -FLT_MAX) continue;
@@ -645,9 +658,20 @@ bool pre75_attn() {
 
 }  // namespace
 
-void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
-                           int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream) {
-    if (n_q <= 0) return;
+bool qsa_decode_attn_pre75_active() {
+#if defined(STRATA_EXPERIMENTAL_SM60)
+    return pre75_attn();
+#else
+    return false;
+#endif
+}
+
+static bool qsa_decode_attn_batch_impl(const float* q, const QsaAttnPools& pools, const int32_t* ids,
+                                       const int32_t* steps, int64_t cap, const QsaShapes& s, float* scratch,
+                                       float* attn, int64_t n_q, void* stream, int64_t max_width_hint,
+                                       bool allow_width, QsaWidthLaunchInfo* info) {
+    if (info != nullptr) *info = QsaWidthLaunchInfo{};
+    if (n_q <= 0) return true;
     if (s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !scratch || !ids || !steps ||
         !pools.page_table || n_q > 65535) {
         std::fprintf(stderr, "qsa_decode_attn_batch: unsupported geometry or missing buffers\n");
@@ -655,6 +679,10 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
     }
     const int kv_mode = pools.k_q4 != nullptr ? 2 : (pools.k_q != nullptr && pools.v_q4 != nullptr ? 3
                         : (pools.k_q != nullptr ? 1 : 0));
+    // STRATA_ATTN_LANECELL=1 - the score phase one cell per thread (bit-identical scores, no shuffle reductions)
+    static const bool lane_cell = [] { const char* v = std::getenv("STRATA_ATTN_LANECELL"); return v && v[0] == '1'; }();
+    // STRATA_ATTN_RS=2 (default): [cell][head] probabilities and the value phase reading a cell's 12 as three vectors.
+    static const int rs_on = [] { const char* v = std::getenv("STRATA_ATTN_RS"); return v ? std::atoi(v) : 2; }();
     const int n_chunks = (int) ((cap + CHUNK - 1) / CHUNK);
     // per query: [acc: n_chunks*n_head*HD][m: n_chunks*n_head][l: n_chunks*n_head], all offsets from one stride
     const long long stride = (long long) qsa_decode_attn_scratch_floats(cap, s);
@@ -662,11 +690,48 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
     float* part_m = scratch + (size_t) n_chunks * s.n_head * HD;
     float* part_l = part_m + (size_t) n_chunks * s.n_head;
     const float scale = 1.0f / sqrtf((float) HD);
-    const dpct::dim3 grid((unsigned)n_chunks, (unsigned)s.n_head_kv,
-                          (unsigned)n_q);
+    // The old entry leaves the cap grid and the full merge
+    // traversal untouched.  The width-bounded entry is opt-in and must either
+    // launch the bounded grid or fail explicitly; it never falls back.
+    int n_chunks_launch = n_chunks;
+    int n_chunks_active = n_chunks;
+    bool width_merge = false;
+    if (allow_width) {
+        if (!qsa_width_bound_enabled()) {
+            std::fprintf(stderr, "qsa_decode_attn_batch_max_width: --qsa-width-bound 1 is required\n");
+            return false;
+        }
+        const bool pre75 = qsa_decode_attn_pre75_active();
+        if (!qsa_width_supported(kv_mode, rs_on, lane_cell, pre75)) {
+            std::fprintf(stderr,
+                         "qsa_decode_attn_batch_max_width: unsupported contract kv_mode=%d rs=%d lane_cell=%d pre75=%d\n",
+                         kv_mode, rs_on, (int) lane_cell, (int) pre75);
+            return false;
+        }
+        const QsaWidthPlan plan = qsa_width_plan(cap, max_width_hint);
+        if (!plan.enabled || plan.n_chunks_cap != n_chunks || plan.n_chunks_launch <= 0 ||
+            plan.n_chunks_launch > n_chunks || plan.n_chunks_active != plan.n_chunks_launch) {
+            std::fprintf(stderr,
+                         "qsa_decode_attn_batch_max_width: invalid hint cap=%lld max_width=%lld n_chunks=%d\n",
+                         (long long) cap, (long long) max_width_hint, n_chunks);
+            return false;
+        }
+        n_chunks_launch = (int) plan.n_chunks_launch;
+        n_chunks_active = (int) plan.n_chunks_active;
+        width_merge = true;
+    }
+    if (info != nullptr) {
+        info->bounded = width_merge;
+        info->n_chunks_cap = n_chunks;
+        info->n_chunks_launch = n_chunks_launch;
+        info->n_chunks_active = n_chunks_active;
+    }
+    const dpct::dim3 grid((unsigned) n_chunks_launch, (unsigned) s.n_head_kv, (unsigned) n_q);
     dpct::queue_ptr st = strata::q_of(stream);
-    // S25: STRATA_ATTN_LANECELL=1 - the score phase one cell per thread (bit-identical scores, no shuffle reductions)
-    static const bool lane_cell = [] { const char* v = std::getenv("STRATA_ATTN_LANECELL"); return v && v[0] == '1'; }();
+    if (!st) {
+        std::fprintf(stderr, "qsa_decode_attn_batch: no queue\n");
+        return false;
+    }
 #define STRATA_ATTN_LC(M)                                                      \
     {                                                                          \
         auto exp_props = sycl::ext::oneapi::experimental::properties{          \
@@ -742,10 +807,6 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
         });                                                                    \
     }
 #undef STRATA_ATTN_RSK_DEFINED
-    // 151-b70: STRATA_ATTN_RS=2 (default): the probabilities in [cell][head] order and the value phase reading a cell's 12 as three vectors - the same
-    // bits (first-token logits md5 equal at 4K and 16K), +0.8..0.9% prompt tok/s on the B70; =1 adds a 16-shuffle reduce-scatter for the scores
-    // (bit-exact too, but -1.5% here: the score phase is not shuffle bound); =0 the layout before
-    static const int rs_on = [] { const char* v = std::getenv("STRATA_ATTN_RS"); return v ? std::atoi(v) : 2; }();
     if (lane_cell) {
         if (kv_mode == 3) { STRATA_ATTN_LC(3); }
         else if (kv_mode == 2) { STRATA_ATTN_LC(2); }
@@ -839,7 +900,7 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
                 sycl::range(1, 1, HD)),
             exp_props, [=](sycl::nd_item<3> item_ct1) {
                 attn_merge_kernel(part_acc, part_m, part_l, n_chunks, attn,
-                                  stride);
+                                  stride, n_chunks_active, width_merge ? steps : nullptr);
             });
     }
     /*
@@ -848,6 +909,19 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
     need to rewrite this code.
     */
     const dpct::err0 e = 0;
+    return true;
+}
+
+void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
+                           int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream) {
+    (void) qsa_decode_attn_batch_impl(q, pools, ids, steps, cap, s, scratch, attn, n_q, stream, 0, false, nullptr);
+}
+
+bool qsa_decode_attn_batch_max_width(const float* q, const QsaAttnPools& pools, const int32_t* ids,
+                                     const int32_t* steps, int64_t cap, const QsaShapes& s, float* scratch,
+                                     float* attn, int64_t n_q, int64_t max_width, void* stream,
+                                     QsaWidthLaunchInfo* info) {
+    return qsa_decode_attn_batch_impl(q, pools, ids, steps, cap, s, scratch, attn, n_q, stream, max_width, true, info);
 }
 
 uint64_t qsa_decode_attn_scratch_floats(int64_t cap, const QsaShapes& s) {

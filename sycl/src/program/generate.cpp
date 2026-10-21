@@ -67,6 +67,9 @@ namespace strata::prefill { void set_nonresident_share(double share); }   // SYC
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/program/split_rules.hpp"
 #include "strata/kernels/qsa.hpp"
+#include "strata/kernels/qsa_decode_attn.hpp"
+#include "strata/kernels/qsa_width_policy.hpp"
+#include "strata/program/qsa_width_option.hpp"
 #include "strata/core/native_head.hpp"
 #include "strata/core/verify.hpp"
 #include "strata/core/mtp.hpp"
@@ -466,6 +469,7 @@ struct Options {
     double ple_delay_us = 0;           ///< fault injection: every row read completes no earlier than this
     bool ple_sync_submit = false;      ///< A/B arm: submit reads on the token thread, no I/O worker
     std::string kv = "fp16";           ///< plan v0.3 P7: KV storage, fp16 (default) or int8 (half the VRAM)
+    int qsa_width_bound = -1;          ///< --qsa-width-bound 0|1; -1 = absent (legacy env/default applies)
     int64_t kv_resident = 0;           ///< KV streaming: resident cells per QSA layer (0: all in VRAM)
     bool kv_grow = false;              ///< the elastic K/V (--kv-grow, STRATA_KV_GROW=1; kvg_ensure)
     std::string dump_residual;
@@ -763,6 +767,9 @@ void usage() {
                  "                       cache holds the rest, giving slots back as the context grows (one GPU, with\n"
                  "                       --expert-profile; STRATA_KV_GROW=1/0 also). Default: the whole --max-context\n"
                  "                       allocated at start\n"
+                 "  --qsa-width-bound 0|1  opt-in QSA valid-width chunk launch/merge. Default 0 unless the legacy\n"
+                 "                       STRATA_QSA_WIDTH_BOUND=1 is present; an explicit CLI value overrides it.\n"
+                 "                       Requires --kv int8, RS2, no LANECELL/pre75\n"
                  "  --stream-token       enqueue token work on the session stream (experimental)\n"
                  "  --check-logits       copy and check all logits in the stream-token path\n"
                  "  --gr-fp32-activations  experimental CUDA-oracle GR activation precision\n"
@@ -1740,6 +1747,7 @@ int main(int argc, char **argv) try {
     bool borrow_explicit = false;   // SYCL port: --prefill-borrow / --no-prefill-borrow given (else chosen by context)
     bool have_tokens = false;
     bool have_logits_stride = false;
+    bool have_qsa_width_bound = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&](const char* what) -> const char* {
@@ -1804,6 +1812,15 @@ int main(int argc, char **argv) try {
         else if (a == "--ple-delay-us") o.ple_delay_us = std::atof(next("--ple-delay-us"));
         else if (a == "--ple-sync-submit") o.ple_sync_submit = true;
         else if (a == "--kv") o.kv = next("--kv");
+        else if (a == "--qsa-width-bound") {
+            if (have_qsa_width_bound) { std::fprintf(stderr, "--qsa-width-bound must be supplied only once\n"); return 2; }
+            std::string width_error;
+            if (!strata::program::qsa_width_parse_cli(next("--qsa-width-bound"), o.qsa_width_bound, width_error)) {
+                std::fprintf(stderr, "strata generate: %s\n", width_error.c_str());
+                return 2;
+            }
+            have_qsa_width_bound = true;
+        }
         else if (a == "--kv-resident") o.kv_resident = std::atoll(next("--kv-resident"));
         else if (a == "--kv-grow") o.kv_grow = true;
         else if (a == "--no-kv-grow") o.kv_grow = false;
@@ -2353,6 +2370,38 @@ int main(int argc, char **argv) try {
         return 2;
     }
     strata::core::qsa_set_kv_resident(o.kv_resident);
+    // One host/startup decision for the QSA width-bound path.  CLI > legacy
+    // STRATA_QSA_WIDTH_BOUND > OFF; an invalid CLI is refused, an unsupported
+    // enabled mode is refused before any attention call, never silently
+    // falling back.  The kernels read only qsa_width_bound_enabled().
+    bool qsa_width_bound_on = false;
+    const char* qsa_width_source = "default";
+    {
+        std::string width_error;
+        if (!strata::program::qsa_width_resolve(o.qsa_width_bound, std::getenv("STRATA_QSA_WIDTH_BOUND"),
+                                                qsa_width_bound_on, qsa_width_source, width_error)) {
+            std::fprintf(stderr, "strata generate: %s\n", width_error.c_str());
+            return 2;
+        }
+    }
+    if (qsa_width_bound_on) {
+        const int qsa_kv_mode = o.kv == "k8v4" ? 3 : (o.kv == "q4_0" ? 2 : (o.kv == "int8" ? 1 : 0));
+        const char* rs_env = std::getenv("STRATA_ATTN_RS");
+        const int qsa_rs = rs_env ? std::atoi(rs_env) : 2;
+        const char* lc_env = std::getenv("STRATA_ATTN_LANECELL");
+        const bool qsa_lane_cell = lc_env != nullptr && lc_env[0] == '1';
+        const bool qsa_pre75 = strata::kernels::qsa_decode_attn_pre75_active();
+        if (!strata::kernels::qsa_width_supported(qsa_kv_mode, qsa_rs, qsa_lane_cell, qsa_pre75)) {
+            std::fprintf(stderr,
+                         "strata generate: --qsa-width-bound 1 is unsupported for --kv %s "
+                         "(requires plain int8, RS2, no LANECELL/pre75; kv_mode=%d rs=%d lane_cell=%d pre75=%d)\n",
+                         o.kv.c_str(), qsa_kv_mode, qsa_rs, (int) qsa_lane_cell, (int) qsa_pre75);
+            return 2;
+        }
+    }
+    strata::kernels::qsa_width_bound_set(qsa_width_bound_on);
+    std::fprintf(stderr, "strata generate: QSA width bound %s (source=%s, --kv %s)\n",
+                 qsa_width_bound_on ? "ON" : "OFF", qsa_width_source, o.kv.c_str());
     // Prompt lookup (the suffix drafter, on by default): the MTP keeps its --spec windows and a lookup window may be
     // up to 2 tokens longer; the draft policy (strata/spec/draft_policy.hpp) takes one only where it pays. Code
     // edits +6-11%, ordinary text unchanged (bench/results/2026-09-27-spec). --suffix-draft 0 turns it off.
